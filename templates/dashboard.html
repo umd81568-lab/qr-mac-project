@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>PDF Link + QR Dashboard</title>
+  </head>
+  <body>
+    <h1>PDF Link + QR Dashboard</h1>
+
+    <form action="/links" method="post" enctype="multipart/form-data">
+      <label>
+        Domain:
+        <input type="text" name="domain" placeholder="example.com" required />
+      </label>
+      <br />
+      <label>
+        Custom Path:
+        <input type="text" name="custom_path" placeholder="my-pdf-link" required />
+      </label>
+      <br />
+      <label>
+        PDF File:
+        <input type="file" name="pdf_file" accept="application/pdf,.pdf" required />
+      </label>
+      <br />
+      <button type="submit">Create Link</button>
+    </form>
+
+    <h2>Saved Links</h2>
+    <table border="1" cellpadding="6">
+      <thead>
+        <tr>
+          <th>ID</th>
+          <th>Live Link</th>
+          <th>QR</th>
+          <th>Access Count</th>
+          <th>Last Accessed</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for link in links %}
+        <tr>
+          <td>{{ link.id }}</td>
+          <td>
+            <a href="https://{{ link.domain }}/{{ link.custom_path }}" target="_blank">
+              https://{{ link.domain }}/{{ link.custom_path }}
+            </a>
+          </td>
+          <td>
+            {% if link.qr_file_name %}
+            <img
+              src="{{ url_for('static', filename='qrcodes/' ~ link.qr_file_name) }}"
+              alt="QR {{ link.id }}"
+              width="120"
+              height="120"
+            />
+            {% endif %}
+          </td>
+          <td>{{ link.access_count }}</td>
+          <td>{{ link.last_accessed or "-" }}</td>
+        </tr>
+        {% else %}
+        <tr>
+          <td colspan="5">No links yet.</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </body>
+</html>
