@@ -4,68 +4,180 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>PDF Link + QR Dashboard</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}" />
   </head>
   <body>
-    <h1>PDF Link + QR Dashboard</h1>
+    <main class="container">
+      <h1>PDF Link + QR Dashboard</h1>
 
-    <form action="/links" method="post" enctype="multipart/form-data">
-      <label>
-        Domain:
-        <input type="text" name="domain" placeholder="example.com" required />
-      </label>
-      <br />
-      <label>
-        Custom Path:
-        <input type="text" name="custom_path" placeholder="my-pdf-link" required />
-      </label>
-      <br />
-      <label>
-        PDF File:
-        <input type="file" name="pdf_file" accept="application/pdf,.pdf" required />
-      </label>
-      <br />
-      <button type="submit">Create Link</button>
-    </form>
-
-    <h2>Saved Links</h2>
-    <table border="1" cellpadding="6">
-      <thead>
-        <tr>
-          <th>ID</th>
-          <th>Live Link</th>
-          <th>QR</th>
-          <th>Access Count</th>
-          <th>Last Accessed</th>
-        </tr>
-      </thead>
-      <tbody>
-        {% for link in links %}
-        <tr>
-          <td>{{ link.id }}</td>
-          <td>
-            <a href="https://{{ link.domain }}/{{ link.custom_path }}" target="_blank">
-              https://{{ link.domain }}/{{ link.custom_path }}
-            </a>
-          </td>
-          <td>
-            {% if link.qr_file_name %}
-            <img
-              src="{{ url_for('static', filename='qrcodes/' ~ link.qr_file_name) }}"
-              alt="QR {{ link.id }}"
-              width="120"
-              height="120"
-            />
-            {% endif %}
-          </td>
-          <td>{{ link.access_count }}</td>
-          <td>{{ link.last_accessed or "-" }}</td>
-        </tr>
-        {% else %}
-        <tr>
-          <td colspan="5">No links yet.</td>
-        </tr>
+      {% with messages = get_flashed_messages(with_categories=true) %}
+      {% if messages %}
+      <ul class="flash-list">
+        {% for category, message in messages %}
+        <li class="flash {{ category }}">{{ message }}</li>
         {% endfor %}
-      </tbody>
-    </table>
+      </ul>
+      {% endif %}
+      {% endwith %}
+
+      <section class="card">
+        <h2>Domains</h2>
+        <form action="{{ url_for('create_domain') }}" method="post" class="stacked-form">
+          <label>
+            Hostname
+            <input type="text" name="hostname" placeholder="example.com" required />
+          </label>
+          <label>
+            <input type="checkbox" name="is_default" value="1" /> Set as default
+          </label>
+          <button type="submit">Add Domain</button>
+        </form>
+
+        <table>
+          <thead>
+            <tr>
+              <th>Hostname</th>
+              <th>Default</th>
+              <th>Action</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for domain in domains %}
+            <tr>
+              <td>{{ domain.hostname }}</td>
+              <td>{{ 'Yes' if domain.is_default else 'No' }}</td>
+              <td>
+                <form action="{{ url_for('delete_domain', domain_id=domain.id) }}" method="post">
+                  <button type="submit">Delete</button>
+                </form>
+              </td>
+            </tr>
+            {% else %}
+            <tr>
+              <td colspan="3">No domains configured.</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </section>
+
+      <section class="card">
+        <h2>Create Link</h2>
+        <form action="{{ url_for('create_link') }}" method="post" enctype="multipart/form-data" class="stacked-form">
+          <label>
+            Domain
+            <select name="domain_id" required>
+              <option value="">Select domain</option>
+              {% for domain in domains %}
+              <option value="{{ domain.id }}">{{ domain.hostname }}</option>
+              {% endfor %}
+            </select>
+          </label>
+
+          <label>
+            Custom Path (supports query and placeholders)
+            <input type="text" name="custom_path" placeholder="docs/invoice?ref=abc or promo/&lt;code&gt;" required />
+          </label>
+
+          <label>
+            Upload from PC
+            <input type="file" name="pdf_file" accept="application/pdf,.pdf" />
+          </label>
+          <label>
+            Import from server path
+            <input type="text" name="server_file_path" placeholder="/srv/pdfs/report.pdf" />
+          </label>
+
+          <button type="submit">Create Link</button>
+        </form>
+      </section>
+
+      <section class="card">
+        <h2>Saved Links</h2>
+        <table>
+          <thead>
+            <tr>
+              <th>ID</th>
+              <th>Live Link</th>
+              <th>QR</th>
+              <th>Analytics</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for link in links %}
+            <tr>
+              <td>{{ link.id }}</td>
+              <td>
+                <a href="{{ link.live_url }}" target="_blank">{{ link.live_url }}</a>
+              </td>
+              <td>
+                {% if link.qr_file_name %}
+                <img
+                  src="{{ url_for('static', filename='qrcodes/' ~ link.qr_file_name) }}"
+                  alt="QR {{ link.id }}"
+                  width="96"
+                  height="96"
+                />
+                {% endif %}
+                <div>
+                  <a href="{{ url_for('download_qr', link_id=link.id, size=512) }}">Download PNG</a>
+                </div>
+              </td>
+              <td>
+                <div>Total: {{ link.access_count }}</div>
+                <div>Last: {{ link.last_accessed or '-' }}</div>
+                <div>First: {{ link.first_accessed or '-' }}</div>
+                <div>7 days: {{ link.last_7_days }}</div>
+                <div>Top referrer: {{ link.top_referrer or '-' }}</div>
+                <div><a href="{{ url_for('link_detail', link_id=link.id) }}">View details</a></div>
+              </td>
+              <td>
+                <form action="{{ url_for('delete_link', link_id=link.id) }}" method="post">
+                  <button type="submit">Delete</button>
+                </form>
+                <details>
+                  <summary>Edit</summary>
+                  <form
+                    action="{{ url_for('edit_link', link_id=link.id) }}"
+                    method="post"
+                    enctype="multipart/form-data"
+                    class="stacked-form"
+                  >
+                    <label>
+                      Domain
+                      <select name="domain_id" required>
+                        {% for domain in domains %}
+                        <option value="{{ domain.id }}" {% if domain.hostname == link.domain %}selected{% endif %}>
+                          {{ domain.hostname }}
+                        </option>
+                        {% endfor %}
+                      </select>
+                    </label>
+                    <label>
+                      Path (query allowed)
+                      <input
+                        type="text"
+                        name="custom_path"
+                        value="{{ link.path_pattern }}{% if link.query_string %}?{{ link.query_string }}{% endif %}"
+                        required
+                      />
+                    </label>
+                    <label>New PDF file (optional) <input type="file" name="pdf_file" accept="application/pdf,.pdf" /></label>
+                    <label>Or server path <input type="text" name="server_file_path" /></label>
+                    <button type="submit">Save</button>
+                  </form>
+                </details>
+              </td>
+            </tr>
+            {% else %}
+            <tr>
+              <td colspan="5">No links yet.</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </section>
+    </main>
   </body>
 </html>
