@@ -259,7 +259,7 @@ def print_demo_admin_banner(url: str, config: dict) -> None:
     print(" ADMIN LOGIN (demo defaults — change these!)")
     print(f" URL:      {url}")
     print(f" USER:     {DEMO_ADMIN_USER}")
-    print(f" PASSWORD: {DEMO_ADMIN_PASSWORD}")
+    print(" PASSWORD: admin123")
     print("============================================================")
 
 
