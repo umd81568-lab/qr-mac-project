@@ -46,6 +46,8 @@ Copy `.env.example` and export values as needed.
 | `MAX_CONTENT_LENGTH` | `52428800` | Max file size (bytes, 50MB default) |
 | `ALLOWED_IMPORT_ROOTS` | `/srv/pdfs:/home` | Allowed server import roots (colon-separated) |
 | `SECRET_KEY` | `dev-secret-key` | Flask flash/session key |
+| `ADMIN_USER` | `admin` | Admin login username (demo default) |
+| `ADMIN_PASSWORD` | `admin123` | Admin login password (demo default; change it) |
 
 ## VPS deployment notes
 
