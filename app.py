@@ -230,11 +230,15 @@ def copy_pdf_from_server_path(app: Flask, source_path: str) -> str:
     if not allowed_roots:
         raise ValueError("no allowed import roots configured")
 
-    resolved = candidate.resolve(strict=True)
+    resolved_roots = [root.resolve() for root in allowed_roots]
+    normalized = Path(os.path.normpath(str(candidate)))
+    if not any(is_subpath(normalized, root) for root in resolved_roots):
+        raise ValueError("server import path is outside allowed roots")
+
+    resolved = normalized.resolve(strict=True)
     if not resolved.is_file():
         raise ValueError("server import path must point to a file")
 
-    resolved_roots = [root.resolve() for root in allowed_roots]
     if not any(is_subpath(resolved, root) for root in resolved_roots):
         raise ValueError("server import path is outside allowed roots")
 
@@ -267,6 +271,8 @@ def fetch_pdf_from_url(app: Flask, source_url: str) -> str:
         raise ValueError("PDF URL must use http or https")
     if not parsed.hostname:
         raise ValueError("PDF URL must include a hostname")
+    if parsed.username or parsed.password:
+        raise ValueError("PDF URL must not include credentials")
 
     try:
         resolved_ips = resolve_hostname_ips(parsed.hostname)
@@ -281,7 +287,13 @@ def fetch_pdf_from_url(app: Flask, source_url: str) -> str:
 
     max_size = int(app.config["MAX_CONTENT_LENGTH"])
     timeout_seconds = float(app.config["URL_IMPORT_TIMEOUT"])
-    request_obj = urlrequest.Request(raw_url, headers={"User-Agent": "qr-mac-project/1.0"})
+    safe_netloc = parsed.hostname
+    if parsed.port:
+        safe_netloc = f"{safe_netloc}:{parsed.port}"
+    safe_url = f"{parsed.scheme}://{safe_netloc}{parsed.path or '/'}"
+    if parsed.query:
+        safe_url = f"{safe_url}?{parsed.query}"
+    request_obj = urlrequest.Request(safe_url, headers={"User-Agent": "qr-mac-project/1.0"})
     opener = urlrequest.build_opener(NoRedirect())
 
     try:
