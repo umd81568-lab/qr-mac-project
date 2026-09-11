@@ -8,7 +8,7 @@ from pathlib import Path
 from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from app import create_app, find_free_port, init_db
+from app import create_app, find_free_port, init_db, print_demo_admin_banner
 
 
 def make_pdf_bytes() -> bytes:
@@ -243,3 +243,29 @@ def test_migration_from_old_schema(tmp_path):
 
         domain_row = con.execute("SELECT hostname FROM domains WHERE hostname = 'legacy.example'").fetchone()
         assert domain_row is not None
+
+
+def test_admin_credentials_default_and_env_override(tmp_path, monkeypatch):
+    monkeypatch.delenv("ADMIN_USER", raising=False)
+    monkeypatch.delenv("ADMIN_PASSWORD", raising=False)
+    app = make_app(tmp_path)
+    assert app.config["ADMIN_USER"] == "admin"
+    assert app.config["ADMIN_PASSWORD"] == "admin123"
+
+    monkeypatch.setenv("ADMIN_USER", "owner")
+    monkeypatch.setenv("ADMIN_PASSWORD", "strong-pass")
+    app_with_env = make_app(tmp_path / "env")
+    assert app_with_env.config["ADMIN_USER"] == "owner"
+    assert app_with_env.config["ADMIN_PASSWORD"] == "strong-pass"
+
+
+def test_demo_admin_banner_prints_only_for_defaults(capsys):
+    print_demo_admin_banner("http://127.0.0.1:8000", {"ADMIN_USER": "admin", "ADMIN_PASSWORD": "admin123"})
+    output = capsys.readouterr().out
+    assert "ADMIN LOGIN (demo defaults — change these!)" in output
+    assert "USER:     admin" in output
+    assert "PASSWORD: admin123" in output
+
+    print_demo_admin_banner("http://127.0.0.1:8000", {"ADMIN_USER": "owner", "ADMIN_PASSWORD": "strong-pass"})
+    output = capsys.readouterr().out
+    assert output == ""

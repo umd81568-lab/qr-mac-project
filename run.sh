@@ -29,6 +29,15 @@ fi
 echo "Chosen port: ${CHOSEN_PORT}"
 echo "Open: http://${IP_ADDR}:${CHOSEN_PORT}"
 
+if [[ "${ADMIN_USER:-admin}" == "admin" && "${ADMIN_PASSWORD:-admin123}" == "admin123" ]]; then
+  echo "============================================================"
+  echo " ADMIN LOGIN (demo defaults — change these!)"
+  echo " URL:      http://${IP_ADDR}:${CHOSEN_PORT}"
+  echo " USER:     admin"
+  echo " PASSWORD: admin123"
+  echo "============================================================"
+fi
+
 if python -c "import gunicorn" >/dev/null 2>&1; then
   exec gunicorn -b "0.0.0.0:${CHOSEN_PORT}" app:app
 fi

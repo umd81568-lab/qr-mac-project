@@ -29,6 +29,8 @@ from werkzeug.utils import secure_filename
 
 RESERVED_PATH_PREFIXES = {"links", "domains", "static", "qr", "api", "dashboard", "health", "_file"}
 PLACEHOLDER_RE = re.compile(r"<([a-zA-Z_][a-zA-Z0-9_]*)>")
+DEMO_ADMIN_USER = "admin"
+DEMO_ADMIN_PASSWORD = "admin123"
 
 
 def utc_now_iso() -> str:
@@ -243,6 +245,24 @@ def detect_local_ip() -> str:
         return "127.0.0.1"
 
 
+def using_demo_admin_credentials(config: dict) -> bool:
+    return (
+        config.get("ADMIN_USER", DEMO_ADMIN_USER) == DEMO_ADMIN_USER
+        and config.get("ADMIN_PASSWORD", DEMO_ADMIN_PASSWORD) == DEMO_ADMIN_PASSWORD
+    )
+
+
+def print_demo_admin_banner(url: str, config: dict) -> None:
+    if not using_demo_admin_credentials(config):
+        return
+    print("============================================================")
+    print(" ADMIN LOGIN (demo defaults — change these!)")
+    print(f" URL:      {url}")
+    print(f" USER:     {DEMO_ADMIN_USER}")
+    print(" PASSWORD: admin123")
+    print("============================================================")
+
+
 def migrate(db_path: str) -> None:
     with sqlite3.connect(db_path) as con:
         con.execute(
@@ -433,6 +453,8 @@ def create_app(test_config: dict | None = None) -> Flask:
         QR_FOLDER=os.getenv("QR_FOLDER", str(root / "static" / "qrcodes")),
         MAX_CONTENT_LENGTH=int(os.getenv("MAX_CONTENT_LENGTH", str(50 * 1024 * 1024))),
         ALLOWED_IMPORT_ROOTS=os.getenv("ALLOWED_IMPORT_ROOTS", "/srv/pdfs:/home"),
+        ADMIN_USER=os.getenv("ADMIN_USER", DEMO_ADMIN_USER),
+        ADMIN_PASSWORD=os.getenv("ADMIN_PASSWORD", DEMO_ADMIN_PASSWORD),
         PORT=int(os.getenv("PORT", "8000")),
     )
     if test_config:
@@ -812,5 +834,7 @@ if __name__ == "__main__":
     port = find_free_port(desired, host=bind_host)
     Path(app.root_path, ".port").write_text(str(port), encoding="utf-8")
     ip = detect_local_ip()
-    print(f"Starting server at http://{ip}:{port}")
+    start_url = f"http://{ip}:{port}"
+    print_demo_admin_banner(start_url, app.config)
+    print(f"Starting server at {start_url}")
     app.run(host=bind_host, port=port)
