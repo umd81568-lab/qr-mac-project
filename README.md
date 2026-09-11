@@ -6,13 +6,15 @@ A Flask dashboard to create domain-based PDF links, generate QR codes, and track
 
 - Multi-domain management from dashboard (add/list/delete)
 - Link creation using a registered domain + custom path/query/template
-- PDF rendering in-browser with PDF.js viewer
+- PDF rendering in-browser using a fully self-hosted same-origin viewer route
 - Raw PDF sub-route with `?download=1` support
 - QR code generated per link and downloadable as PNG
 - Access analytics + detailed access logs + JSON stats API
 - PDF import from:
   - browser upload
   - server-side absolute path (restricted by allowed roots)
+  - URL import (`http/https`) with SSRF + size/signature safeguards
+- HTTP Basic auth for admin dashboard and management APIs
 - Lightweight SQLite schema migrations for existing databases
 - One-command VPS start script with free-port auto-selection
 
@@ -43,9 +45,15 @@ Copy `.env.example` and export values as needed.
 | `UPLOAD_FOLDER` | `uploads` | Stored PDF files |
 | `QR_FOLDER` | `static/qrcodes` | Stored QR PNG files |
 | `PORT` | `8000` | Preferred start port |
+| `BIND_HOST` | `0.0.0.0` | Host interface used for probing and serving |
 | `MAX_CONTENT_LENGTH` | `52428800` | Max file size (bytes, 50MB default) |
-| `ALLOWED_IMPORT_ROOTS` | `/srv/pdfs:/home` | Allowed server import roots (colon-separated) |
-| `SECRET_KEY` | `dev-secret-key` | Flask flash/session key |
+| `ALLOWED_IMPORT_ROOTS` | `/srv/pdfs` | Allowed server import roots (colon-separated) |
+| `ADMIN_USER` | `admin` | HTTP Basic auth username for admin routes |
+| `ADMIN_PASSWORD` | _(required outside testing)_ | HTTP Basic auth password for admin routes |
+| `SECRET_KEY` | _(auto-generated if missing)_ | Flask flash/session key |
+
+> If `SECRET_KEY` is missing, the app generates one at startup and logs a warning; sessions will not survive restart.
+> If `ADMIN_PASSWORD` is missing and `TESTING` is not enabled, the app refuses to start.
 
 ## VPS deployment notes
 

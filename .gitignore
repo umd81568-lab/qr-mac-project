@@ -6,3 +6,4 @@ uploads/
 static/qrcodes/
 .venv/
 .port
+.env
