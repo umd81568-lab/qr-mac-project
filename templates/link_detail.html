@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Link Detail</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}" />
+  </head>
+  <body>
+    <main class="container">
+      <a href="{{ url_for('dashboard') }}">&larr; Back to dashboard</a>
+      <h1>Link #{{ link.id }}</h1>
+      <p>{{ link.domain }}/{{ link.path_pattern }}{% if link.query_string %}?{{ link.query_string }}{% endif %}</p>
+
+      <ul>
+        <li>Total access count: {{ stats.total_access_count }}</li>
+        <li>Last accessed: {{ stats.last_accessed or '-' }}</li>
+        <li>First accessed: {{ stats.first_accessed or '-' }}</li>
+        <li>Accesses in last 7 days: {{ stats.last_7_days }}</li>
+        <li>Top referrer: {{ stats.top_referrer or '-' }}</li>
+      </ul>
+
+      <h2>Recent Access Logs</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Accessed At</th>
+            <th>IP</th>
+            <th>User Agent</th>
+            <th>Query Params</th>
+            <th>Referrer</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for log in logs %}
+          <tr>
+            <td>{{ log.accessed_at }}</td>
+            <td>{{ log.ip or '-' }}</td>
+            <td>{{ log.user_agent or '-' }}</td>
+            <td><code>{{ log.query_params or '{}' }}</code></td>
+            <td>{{ log.referrer or '-' }}</td>
+          </tr>
+          {% else %}
+          <tr>
+            <td colspan="5">No access logs yet.</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </main>
+  </body>
+</html>
