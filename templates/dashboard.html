@@ -87,6 +87,10 @@
             Import from server path
             <input type="text" name="server_file_path" placeholder="/srv/pdfs/report.pdf" />
           </label>
+          <label>
+            Import from URL
+            <input type="url" name="pdf_url" placeholder="https://example.com/report.pdf" />
+          </label>
 
           <button type="submit">Create Link</button>
         </form>
@@ -165,6 +169,7 @@
                     </label>
                     <label>New PDF file (optional) <input type="file" name="pdf_file" accept="application/pdf,.pdf" /></label>
                     <label>Or server path <input type="text" name="server_file_path" /></label>
+                    <label>Or URL <input type="url" name="pdf_url" /></label>
                     <button type="submit">Save</button>
                   </form>
                 </details>

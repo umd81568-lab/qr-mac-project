@@ -7,15 +7,22 @@ import shutil
 import socket
 import sqlite3
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
+from functools import wraps
 from io import BytesIO
+import ipaddress
 from pathlib import Path
-from urllib.parse import quote, urlparse, urlsplit
+import secrets
+from urllib import error as urlerror
+from urllib import request as urlrequest
+from urllib.parse import urlparse, urlsplit
 
 import qrcode
 from PIL import Image
 from flask import (
     Flask,
+    Response,
     abort,
     flash,
     jsonify,
@@ -29,6 +36,12 @@ from werkzeug.utils import secure_filename
 
 RESERVED_PATH_PREFIXES = {"links", "domains", "static", "qr", "api", "dashboard", "health", "_file"}
 PLACEHOLDER_RE = re.compile(r"<([a-zA-Z_][a-zA-Z0-9_]*)>")
+LOCAL_DEV_HOSTS = {"localhost", "127.0.0.1", "::1", "0.0.0.0"}
+METADATA_IPS = {
+    ipaddress.ip_address("169.254.169.254"),
+    ipaddress.ip_address("169.254.170.2"),
+    ipaddress.ip_address("100.100.100.200"),
+}
 
 
 def utc_now_iso() -> str:
@@ -123,11 +136,62 @@ def is_subpath(path: Path, root: Path) -> bool:
         return False
 
 
+def extract_host_without_port(raw_host: str) -> str:
+    value = (raw_host or "").strip()
+    if not value:
+        return ""
+    parsed = urlsplit(f"//{value}")
+    if parsed.hostname:
+        return parsed.hostname.lower()
+    if ":" in value and value.count(":") > 1:
+        return value.strip("[]").lower()
+    return value.lower()
+
+
+def is_local_host(host: str) -> bool:
+    value = extract_host_without_port(host)
+    if not value:
+        return False
+    if value in LOCAL_DEV_HOSTS:
+        return True
+    try:
+        ipaddress.ip_address(value)
+        return True
+    except ValueError:
+        return False
+
+
+def is_disallowed_remote_ip(ip_value: ipaddress._BaseAddress) -> bool:
+    return (
+        ip_value.is_private
+        or ip_value.is_loopback
+        or ip_value.is_link_local
+        or ip_value.is_multicast
+        or ip_value.is_unspecified
+        or ip_value in METADATA_IPS
+    )
+
+
+def resolve_hostname_ips(hostname: str) -> set[ipaddress._BaseAddress]:
+    resolved_ips: set[ipaddress._BaseAddress] = set()
+    for family, _, _, _, sockaddr in socket.getaddrinfo(hostname, None):
+        if family == socket.AF_INET:
+            resolved_ips.add(ipaddress.ip_address(sockaddr[0]))
+        elif family == socket.AF_INET6:
+            resolved_ips.add(ipaddress.ip_address(sockaddr[0]))
+    return resolved_ips
+
+
 def ensure_pdf_signature(path: Path) -> None:
     with path.open("rb") as file_obj:
         signature = file_obj.read(4)
     if signature != b"%PDF":
         raise ValueError("file is not a valid PDF")
+
+
+def ensure_pdf_signature_bytes(content: bytes) -> None:
+    if content[:4] != b"%PDF":
+        raise ValueError("remote file is not a valid PDF")
 
 
 def save_uploaded_file(app: Flask, uploaded_file) -> str:
@@ -166,15 +230,12 @@ def copy_pdf_from_server_path(app: Flask, source_path: str) -> str:
     if not allowed_roots:
         raise ValueError("no allowed import roots configured")
 
-    normalized = Path(os.path.normpath(str(candidate)))
-    if not any(is_subpath(normalized, root) for root in allowed_roots):
-        raise ValueError("server import path is outside allowed roots")
-
-    resolved = normalized.resolve(strict=True)
+    resolved = candidate.resolve(strict=True)
     if not resolved.is_file():
         raise ValueError("server import path must point to a file")
 
-    if not any(is_subpath(resolved, root) for root in allowed_roots):
+    resolved_roots = [root.resolve() for root in allowed_roots]
+    if not any(is_subpath(resolved, root) for root in resolved_roots):
         raise ValueError("server import path is outside allowed roots")
 
     max_size = int(app.config["MAX_CONTENT_LENGTH"])
@@ -191,19 +252,85 @@ def copy_pdf_from_server_path(app: Flask, source_path: str) -> str:
     return saved_pdf_name
 
 
+class NoRedirect(urlrequest.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urlerror.HTTPError(newurl, code, "redirects are not allowed", headers, fp)
+
+
+def fetch_pdf_from_url(app: Flask, source_url: str) -> str:
+    raw_url = (source_url or "").strip()
+    if not raw_url:
+        raise ValueError("PDF URL is required")
+
+    parsed = urlsplit(raw_url)
+    if parsed.scheme not in {"http", "https"}:
+        raise ValueError("PDF URL must use http or https")
+    if not parsed.hostname:
+        raise ValueError("PDF URL must include a hostname")
+
+    try:
+        resolved_ips = resolve_hostname_ips(parsed.hostname)
+    except OSError as exc:
+        raise ValueError("could not resolve PDF URL hostname") from exc
+    if not resolved_ips:
+        raise ValueError("could not resolve PDF URL hostname")
+
+    for ip_value in resolved_ips:
+        if is_disallowed_remote_ip(ip_value):
+            raise ValueError("PDF URL resolves to a disallowed address")
+
+    max_size = int(app.config["MAX_CONTENT_LENGTH"])
+    timeout_seconds = float(app.config["URL_IMPORT_TIMEOUT"])
+    request_obj = urlrequest.Request(raw_url, headers={"User-Agent": "qr-mac-project/1.0"})
+    opener = urlrequest.build_opener(NoRedirect())
+
+    try:
+        with opener.open(request_obj, timeout=timeout_seconds) as response:
+            chunks: list[bytes] = []
+            total_size = 0
+            while True:
+                chunk = response.read(64 * 1024)
+                if not chunk:
+                    break
+                total_size += len(chunk)
+                if total_size > max_size:
+                    raise ValueError("remote file exceeds maximum size")
+                chunks.append(chunk)
+    except ValueError:
+        raise
+    except (urlerror.URLError, TimeoutError, OSError) as exc:
+        raise ValueError("failed to download PDF URL") from exc
+
+    content = b"".join(chunks)
+    ensure_pdf_signature_bytes(content)
+
+    source_name = Path(parsed.path).name or "remote.pdf"
+    safe_name = secure_filename(source_name)
+    if not safe_name.lower().endswith(".pdf"):
+        safe_name = f"{safe_name}.pdf"
+    saved_pdf_name = f"{uuid.uuid4().hex}-{safe_name}"
+    saved_pdf_path = Path(app.config["UPLOAD_FOLDER"]) / saved_pdf_name
+    saved_pdf_path.write_bytes(content)
+    ensure_pdf_signature(saved_pdf_path)
+    return saved_pdf_name
+
+
 def save_pdf_from_inputs(app: Flask, require_pdf: bool = True) -> str | None:
     uploaded_file = request.files.get("pdf_file")
     server_path = (request.form.get("server_file_path", "") or "").strip()
+    source_url = (request.form.get("pdf_url", "") or "").strip()
 
     modes = 0
     if uploaded_file and uploaded_file.filename:
         modes += 1
     if server_path:
         modes += 1
+    if source_url:
+        modes += 1
 
     if modes == 0:
         if require_pdf:
-            raise ValueError("provide one PDF source: upload or server path")
+            raise ValueError("provide one PDF source: upload, server path, or URL")
         return None
     if modes > 1:
         raise ValueError("use only one PDF source at a time")
@@ -212,7 +339,29 @@ def save_pdf_from_inputs(app: Flask, require_pdf: bool = True) -> str | None:
         return save_uploaded_file(app, uploaded_file)
     if server_path:
         return copy_pdf_from_server_path(app, server_path)
+    if source_url:
+        return fetch_pdf_from_url(app, source_url)
     return None
+
+
+@contextmanager
+def db_connection(db_path: str):
+    con = sqlite3.connect(db_path)
+    con.row_factory = sqlite3.Row
+    con.execute("PRAGMA foreign_keys = ON")
+    try:
+        yield con
+    except Exception:
+        con.rollback()
+        raise
+    else:
+        con.commit()
+    finally:
+        con.close()
+
+
+def db(app: Flask):
+    return db_connection(app.config["DATABASE"])
 
 
 def add_security_headers(response):
@@ -221,15 +370,27 @@ def add_security_headers(response):
     return response
 
 
-def find_free_port(start_port: int = 8000, host: str = "127.0.0.1", max_attempts: int = 200) -> int:
-    port = int(start_port)
-    for candidate in range(port, port + max_attempts):
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+def can_bind(host: str, port: int) -> bool:
+    try:
+        addresses = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except OSError:
+        return False
+    for family, socktype, proto, _, sockaddr in addresses:
+        if socktype != socket.SOCK_STREAM:
+            continue
+        with socket.socket(family, socktype, proto) as sock:
             try:
-                sock.bind((host, candidate))
+                sock.bind(sockaddr)
             except OSError:
                 continue
+            return True
+    return False
+
+
+def find_free_port(start_port: int = 8000, host: str = "0.0.0.0", max_attempts: int = 200) -> int:
+    port = int(start_port)
+    for candidate in range(port, port + max_attempts):
+        if can_bind(host, candidate):
             return candidate
     raise RuntimeError("could not find a free port")
 
@@ -244,7 +405,7 @@ def detect_local_ip() -> str:
 
 
 def migrate(db_path: str) -> None:
-    with sqlite3.connect(db_path) as con:
+    with db_connection(db_path) as con:
         con.execute(
             """
             CREATE TABLE IF NOT EXISTS links (
@@ -311,12 +472,7 @@ def migrate(db_path: str) -> None:
                 )
 
         domain_count = con.execute("SELECT COUNT(*) FROM domains").fetchone()[0]
-        if domain_count == 0:
-            con.execute(
-                "INSERT INTO domains (hostname, is_default, created_at) VALUES (?, 1, ?)",
-                ("localhost", now),
-            )
-        elif con.execute("SELECT COUNT(*) FROM domains WHERE is_default = 1").fetchone()[0] == 0:
+        if domain_count > 0 and con.execute("SELECT COUNT(*) FROM domains WHERE is_default = 1").fetchone()[0] == 0:
             first_id = con.execute("SELECT id FROM domains ORDER BY id LIMIT 1").fetchone()[0]
             con.execute("UPDATE domains SET is_default = CASE WHEN id = ? THEN 1 ELSE 0 END", (first_id,))
 
@@ -326,8 +482,7 @@ def init_db(db_path: str) -> None:
 
 
 def get_dashboard_context(app: Flask) -> dict:
-    with sqlite3.connect(app.config["DATABASE"]) as con:
-        con.row_factory = sqlite3.Row
+    with db(app) as con:
         domains = con.execute(
             "SELECT id, hostname, is_default, created_at FROM domains ORDER BY is_default DESC, hostname ASC"
         ).fetchall()
@@ -427,16 +582,25 @@ def create_app(test_config: dict | None = None) -> Flask:
 
     root = Path(app.root_path)
     app.config.update(
-        SECRET_KEY=os.getenv("SECRET_KEY", "dev-secret-key"),
+        SECRET_KEY=os.getenv("SECRET_KEY"),
         DATABASE=os.getenv("DATABASE", str(root / "instance" / "links.db")),
         UPLOAD_FOLDER=os.getenv("UPLOAD_FOLDER", str(root / "uploads")),
         QR_FOLDER=os.getenv("QR_FOLDER", str(root / "static" / "qrcodes")),
         MAX_CONTENT_LENGTH=int(os.getenv("MAX_CONTENT_LENGTH", str(50 * 1024 * 1024))),
-        ALLOWED_IMPORT_ROOTS=os.getenv("ALLOWED_IMPORT_ROOTS", "/srv/pdfs:/home"),
+        ALLOWED_IMPORT_ROOTS=os.getenv("ALLOWED_IMPORT_ROOTS", "/srv/pdfs"),
+        ADMIN_USER=os.getenv("ADMIN_USER", "admin"),
+        ADMIN_PASSWORD=os.getenv("ADMIN_PASSWORD"),
+        DISABLE_ADMIN_AUTH=False,
+        URL_IMPORT_TIMEOUT=float(os.getenv("URL_IMPORT_TIMEOUT", "10")),
         PORT=int(os.getenv("PORT", "8000")),
     )
     if test_config:
         app.config.update(test_config)
+    if not app.config.get("SECRET_KEY"):
+        app.config["SECRET_KEY"] = secrets.token_hex(32)
+        app.logger.warning("SECRET_KEY is not set; generated ephemeral key, sessions will reset after restart.")
+    if not app.config.get("TESTING") and not app.config.get("ADMIN_PASSWORD"):
+        raise RuntimeError("ADMIN_PASSWORD must be set unless TESTING is enabled.")
 
     os.makedirs(Path(app.config["DATABASE"]).parent, exist_ok=True)
     os.makedirs(app.config["UPLOAD_FOLDER"], exist_ok=True)
@@ -455,11 +619,61 @@ def create_app(test_config: dict | None = None) -> Flask:
     def regenerate_qr(link_id: int, live_url: str) -> str:
         qr_file_name = f"{link_id}.png"
         qr_path = Path(app.config["QR_FOLDER"]) / qr_file_name
-        qrcode.make(live_url).save(qr_path)
+        qr = qrcode.QRCode(box_size=10, border=4)
+        qr.add_data(live_url)
+        qr.make(fit=True)
+        qr.make_image(fill_color="black", back_color="white").convert("RGB").save(qr_path, format="PNG")
         return qr_file_name
+
+    def build_qr_image(live_url: str, size: int) -> BytesIO:
+        qr = qrcode.QRCode(box_size=16, border=4)
+        qr.add_data(live_url)
+        qr.make(fit=True)
+        image = qr.make_image(fill_color="black", back_color="white").convert("RGB")
+        if image.size != (size, size):
+            image = image.resize((size, size), Image.Resampling.NEAREST)
+        out = BytesIO()
+        image.save(out, format="PNG")
+        out.seek(0)
+        return out
+
+    def requires_auth() -> bool:
+        return not app.config.get("DISABLE_ADMIN_AUTH", False)
+
+    def check_admin_auth() -> bool:
+        if not requires_auth():
+            return True
+        auth = request.authorization
+        if auth is None or not auth.username:
+            return False
+        return secrets.compare_digest(auth.username, str(app.config["ADMIN_USER"])) and secrets.compare_digest(
+            auth.password or "", str(app.config["ADMIN_PASSWORD"])
+        )
+
+    def auth_required_response() -> Response:
+        return Response(
+            "Authentication required.",
+            status=401,
+            headers={"WWW-Authenticate": 'Basic realm="QR Admin"'},
+        )
+
+    def require_admin(view_func):
+        @wraps(view_func)
+        def wrapped(*args, **kwargs):
+            if not check_admin_auth():
+                return auth_required_response()
+            return view_func(*args, **kwargs)
+
+        return wrapped
+
+    @app.errorhandler(413)
+    def request_entity_too_large(_error):
+        flash("Uploaded file exceeds maximum size.", "error")
+        return render_dashboard(413)
 
     @app.get("/")
     @app.get("/dashboard")
+    @require_admin
     def dashboard():
         return render_dashboard()
 
@@ -468,6 +682,7 @@ def create_app(test_config: dict | None = None) -> Flask:
         return jsonify({"status": "ok"})
 
     @app.post("/domains")
+    @require_admin
     def create_domain():
         hostname = normalize_domain(request.form.get("hostname", ""))
         set_default = request.form.get("is_default") == "1"
@@ -476,7 +691,7 @@ def create_app(test_config: dict | None = None) -> Flask:
             return render_dashboard(400)
 
         try:
-            with sqlite3.connect(app.config["DATABASE"]) as con:
+            with db(app) as con:
                 if set_default:
                     con.execute("UPDATE domains SET is_default = 0")
                 con.execute(
@@ -494,9 +709,9 @@ def create_app(test_config: dict | None = None) -> Flask:
         return redirect(url_for("dashboard"))
 
     @app.post("/domains/<int:domain_id>/delete")
+    @require_admin
     def delete_domain(domain_id: int):
-        with sqlite3.connect(app.config["DATABASE"]) as con:
-            con.row_factory = sqlite3.Row
+        with db(app) as con:
             domain = con.execute("SELECT id, hostname, is_default FROM domains WHERE id = ?", (domain_id,)).fetchone()
             if domain is None:
                 abort(404)
@@ -516,6 +731,7 @@ def create_app(test_config: dict | None = None) -> Flask:
         return redirect(url_for("dashboard"))
 
     @app.post("/links")
+    @require_admin
     def create_link():
         domain_id_raw = (request.form.get("domain_id", "") or "").strip()
         custom_path_input = request.form.get("custom_path", "")
@@ -536,8 +752,7 @@ def create_app(test_config: dict | None = None) -> Flask:
             return render_dashboard(400)
 
         try:
-            with sqlite3.connect(app.config["DATABASE"]) as con:
-                con.row_factory = sqlite3.Row
+            with db(app) as con:
                 domain = con.execute("SELECT id, hostname FROM domains WHERE id = ?", (int(domain_id_raw),)).fetchone()
                 if domain is None:
                     flash("Selected domain does not exist.", "error")
@@ -570,6 +785,7 @@ def create_app(test_config: dict | None = None) -> Flask:
         return redirect(url_for("dashboard"))
 
     @app.post("/links/<int:link_id>/edit")
+    @require_admin
     def edit_link(link_id: int):
         domain_id_raw = (request.form.get("domain_id", "") or "").strip()
         custom_path_input = request.form.get("custom_path", "")
@@ -590,8 +806,7 @@ def create_app(test_config: dict | None = None) -> Flask:
             return render_dashboard(400)
 
         try:
-            with sqlite3.connect(app.config["DATABASE"]) as con:
-                con.row_factory = sqlite3.Row
+            with db(app) as con:
                 link = get_link_or_404(con, link_id)
                 domain = con.execute("SELECT hostname FROM domains WHERE id = ?", (int(domain_id_raw),)).fetchone()
                 if domain is None:
@@ -626,9 +841,9 @@ def create_app(test_config: dict | None = None) -> Flask:
         return redirect(url_for("dashboard"))
 
     @app.post("/links/<int:link_id>/delete")
+    @require_admin
     def delete_link(link_id: int):
-        with sqlite3.connect(app.config["DATABASE"]) as con:
-            con.row_factory = sqlite3.Row
+        with db(app) as con:
             link = get_link_or_404(con, link_id)
             con.execute("DELETE FROM link_access_log WHERE link_id = ?", (link_id,))
             con.execute("DELETE FROM links WHERE id = ?", (link_id,))
@@ -640,8 +855,7 @@ def create_app(test_config: dict | None = None) -> Flask:
         return redirect(url_for("dashboard"))
 
     def resolve_link_for_request(host: str, requested_path: str) -> tuple[sqlite3.Row | None, bool]:
-        with sqlite3.connect(app.config["DATABASE"]) as con:
-            con.row_factory = sqlite3.Row
+        with db(app) as con:
             host_registered = (
                 con.execute("SELECT 1 FROM domains WHERE hostname = ?", (host,)).fetchone() is not None
             )
@@ -660,7 +874,7 @@ def create_app(test_config: dict | None = None) -> Flask:
             if len(host_matches) > 1:
                 return None, host_registered
 
-            if host_registered:
+            if host_registered and not is_local_host(host):
                 return None, host_registered
 
             all_rows = con.execute(
@@ -678,7 +892,7 @@ def create_app(test_config: dict | None = None) -> Flask:
 
     def log_access_and_increment(link_id: int) -> None:
         query_json = json.dumps(request.args.to_dict(flat=False), ensure_ascii=False)
-        with sqlite3.connect(app.config["DATABASE"]) as con:
+        with db(app) as con:
             con.execute(
                 """
                 UPDATE links
@@ -704,8 +918,7 @@ def create_app(test_config: dict | None = None) -> Flask:
 
     @app.get("/_file/<int:link_id>.pdf")
     def serve_pdf_file(link_id: int):
-        with sqlite3.connect(app.config["DATABASE"]) as con:
-            con.row_factory = sqlite3.Row
+        with db(app) as con:
             link = get_link_or_404(con, link_id)
 
         pdf_path = Path(app.config["UPLOAD_FOLDER"]) / link["pdf_file_name"]
@@ -729,8 +942,7 @@ def create_app(test_config: dict | None = None) -> Flask:
         if size not in {"256", "512", "1024"}:
             abort(400, "size must be one of 256, 512, 1024")
 
-        with sqlite3.connect(app.config["DATABASE"]) as con:
-            con.row_factory = sqlite3.Row
+        with db(app) as con:
             link = get_link_or_404(con, link_id)
 
         qr_path = Path(app.config["QR_FOLDER"]) / (link["qr_file_name"] or f"{link_id}.png")
@@ -738,11 +950,8 @@ def create_app(test_config: dict | None = None) -> Flask:
             live_url = build_live_url(link["domain"], link["path_pattern"], link["query_string"] or "")
             regenerate_qr(link_id, live_url)
 
-        with Image.open(qr_path) as img:
-            resized = img.resize((int(size), int(size)))
-            out = BytesIO()
-            resized.save(out, format="PNG")
-            out.seek(0)
+        live_url = build_live_url(link["domain"], link["path_pattern"], link["query_string"] or "")
+        out = build_qr_image(live_url, int(size))
 
         return send_file(
             out,
@@ -752,9 +961,9 @@ def create_app(test_config: dict | None = None) -> Flask:
         )
 
     @app.get("/links/<int:link_id>")
+    @require_admin
     def link_detail(link_id: int):
-        with sqlite3.connect(app.config["DATABASE"]) as con:
-            con.row_factory = sqlite3.Row
+        with db(app) as con:
             link = get_link_or_404(con, link_id)
             logs = con.execute(
                 """
@@ -771,9 +980,9 @@ def create_app(test_config: dict | None = None) -> Flask:
         return render_template("link_detail.html", link=link, logs=logs, stats=stats)
 
     @app.get("/api/links/<int:link_id>/stats")
+    @require_admin
     def link_stats_api(link_id: int):
-        with sqlite3.connect(app.config["DATABASE"]) as con:
-            con.row_factory = sqlite3.Row
+        with db(app) as con:
             link = get_link_or_404(con, link_id)
             stats = get_link_stats(con, link_id, link["access_count"], link["last_accessed"])
         return jsonify({"link_id": link_id, **stats})
@@ -781,7 +990,7 @@ def create_app(test_config: dict | None = None) -> Flask:
     @app.get("/<path:custom_path>")
     def serve_pdf(custom_path: str):
         requested_path = normalize_path(custom_path)
-        host = request.host.split(":")[0].strip().lower()
+        host = extract_host_without_port(request.host)
 
         link, _ = resolve_link_for_request(host, requested_path)
         if link is None:
@@ -796,8 +1005,7 @@ def create_app(test_config: dict | None = None) -> Flask:
         if request.args.get("download") == "1":
             return redirect(url_for("serve_pdf_file", link_id=link["id"], download=1))
 
-        file_url = url_for("serve_pdf_file", link_id=link["id"], _external=True)
-        viewer_url = f"https://mozilla.github.io/pdf.js/web/viewer.html?file={quote(file_url, safe='')}"
+        viewer_url = url_for("serve_pdf_file", link_id=link["id"])
         return render_template("viewer.html", link=link, viewer_url=viewer_url)
 
     return app
@@ -808,8 +1016,10 @@ app = create_app()
 
 if __name__ == "__main__":
     desired = int(os.getenv("PORT", str(app.config.get("PORT", 8000))))
-    bind_host = os.getenv("BIND_HOST", "127.0.0.1")
+    bind_host = os.getenv("BIND_HOST", "0.0.0.0")
     port = find_free_port(desired, host=bind_host)
+    if not can_bind(bind_host, port):
+        raise RuntimeError(f"Selected port {port} on host {bind_host} is no longer free; please retry.")
     Path(app.root_path, ".port").write_text(str(port), encoding="utf-8")
     ip = detect_local_ip()
     print(f"Starting server at http://{ip}:{port}")
